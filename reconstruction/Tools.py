@@ -1,13 +1,14 @@
-import os
 from pytomography.io.SPECT import dicom
 from pytomography.transforms.SPECT import SPECTAttenuationTransform, SPECTPSFTransform
-from pytomography.algorithms import OSEM
+from pytomography.priors import RelativeDifferencePrior
+from pytomography.priors import TopNAnatomyNeighbourWeight
+from pytomography.algorithms import OSEM, BSREM
 from pytomography.projectors.SPECT import SPECTSystemMatrix
 from pytomography.likelihoods import PoissonLogLikelihood
 import pydicom
 import torch
 from typing import List, Dict
-from Subsample import subsample_projections_number, subsample_projections_time
+from reconstruction.Subsample import subsample_projections_number, subsample_projections_time
 from pytomography.utils.scatter import get_smoothed_scatter
 
 def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], params: Dict, output_path: str) -> None:
@@ -43,9 +44,7 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
     reconstructed_beds: List[torch.Tensor] = []
     
     for bed_pos_proj, bed_pos_dcm in zip(projections, projection_data_dcm):
-        
-        
-        
+                
         # Read original data
         dicom_ds = pydicom.dcmread(bed_pos_dcm, force=True)
         object_meta, proj_meta = dicom.get_metadata(bed_pos_dcm, index_peak=index_photopeak)
@@ -73,6 +72,7 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
             scatter_projections = get_smoothed_scatter(scatter=scatter_projections, proj_meta=proj_meta, sigma_r=1.0, sigma_z=1.0)
         
         # Apply data reduction: subsample projections number
+        print(proj_meta)
         if "Projections" in params["Data_Reduction"]:
             photopeak_projections, scatter_projections, object_meta, proj_meta = subsample_projections_number(
                 photopeak=photopeak_projections, 
@@ -81,15 +81,19 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
                 proj_meta=proj_meta,
                 parameters=params["Data_Reduction"]["Projections"]
             )
+            
+        print(proj_meta)
                     
         # Build System Matrix
         
         # Attenuation
         attenuation_map = dicom.get_attenuation_map_from_CT_slices(files_CT=ct_data_dcm, file_NM=bed_pos_dcm, index_peak=index_photopeak)
         att_transform = SPECTAttenuationTransform(attenuation_map)
+        att_transform.configure(object_meta=object_meta, proj_meta=proj_meta)
+        att_map = att_transform.attenuation_map
         
         # Resolution Model
-        psf_meta = dicom.get_psfmeta_from_scanner_params(collimator_name="SY-ME", energy_keV=208)
+        psf_meta = dicom.get_psfmeta_from_scanner_params(collimator_name=params["Collimator"], energy_keV=params["Photopeak_Energy"])
         psf_transform = SPECTPSFTransform(psf_meta)
         
         system_matrix = SPECTSystemMatrix(
@@ -103,6 +107,15 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
         # Reconstruct
         if params["Algorithm"] == "OSEM":
             reconstruction_algorithm = OSEM(likelihood)
+            
+        elif params["Algorithm"] == "BSREM":
+            weight_top8anatomy = TopNAnatomyNeighbourWeight(anatomy_image=att_map, N_neighbours=8)
+            prior_rdpap = RelativeDifferencePrior(beta=0.3, gamma=2, weight=weight_top8anatomy)
+            reconstruction_algorithm = BSREM(
+                likelihood,
+                prior = prior_rdpap,
+                relaxation_sequence = lambda n: 1/(n/50+1))
+        
         else:
             raise NotImplementedError(f"{params['Algorithm']} is not supported")
         
@@ -112,11 +125,13 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
     wb_recon = dicom.stitch_multibed(recons=torch.stack(reconstructed_beds), files_NM=projection_data_dcm)
     
     # Save DICOM
+    print(f"Saving: {params['Recon_Name']} ... ")
+    
     dicom.save_dcm(
         save_path=output_path,
         object=wb_recon,
         file_NM = projection_data_dcm[0],
-        recon_name="test",
+        recon_name=params["Recon_Name"],
         single_dicom_file=True)
         
     

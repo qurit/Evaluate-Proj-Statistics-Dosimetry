@@ -1,7 +1,7 @@
-from pytomography.io.SPECT.shared import subsample_projections_and_modify_metadata, subsample_projections
+from pytomography.io.SPECT.shared import subsample_projections, subsample_metadata
 from torch import Tensor
 from pytomography.metadata.SPECT import SPECTObjectMeta, SPECTProjMeta
-from typing import Sequence, Dict, Any
+from typing import Tuple, Dict, Any
 
 import torch
 from torch.distributions import Binomial
@@ -46,7 +46,7 @@ def subsample_projections_number(
     scatter: Tensor,
     object_meta: SPECTObjectMeta,
     proj_meta: SPECTProjMeta,
-    parameters: Dict[Any]) -> Sequence[Tensor, Tensor, SPECTObjectMeta, SPECTProjMeta]:
+    parameters: Dict[str, Any]) -> Tuple[Tensor, Tensor, SPECTObjectMeta, SPECTProjMeta]:
     """_summary_
 
     Parameters
@@ -64,22 +64,35 @@ def subsample_projections_number(
         
     Returns
     -------
-    Sequence[Tensor, Tensor, SPECTObjectMeta, SPECTProjMeta]
+    Tuple[Tensor, Tensor, SPECTObjectMeta, SPECTProjMeta]
         _description_
     """
     
     if "Angle_Reduction" not in parameters or "Angle_Start_Index" not in parameters:
         raise AssertionError(f"Missing adequate parameters to subsample projecttions. Found {parameters}")
     
-    object_meta, proj_meta, photopeak = subsample_projections_and_modify_metadata(
-        object_meta=object_meta, proj_meta=proj_meta, projections=photopeak,
+    object_meta, proj_meta = subsample_metadata(
+        object_meta=object_meta,
+        proj_meta=proj_meta,
+        N_pixel=1,
         N_angle=parameters["Angle_Reduction"], 
         N_angle_start=parameters["Angle_Start_Index"]
     )
     
-    scatter = subsample_projections(projections=scatter, 
+    # Photopeak
+    photopeak = subsample_projections(
+        projections=photopeak,
+        N_pixel=1,
+        N_angle=parameters["Angle_Reduction"],
+        N_angle_start=parameters["Angle_Start_Index"],
+                                    
+    )
+    
+    # Scatter
+    scatter = subsample_projections(projections=scatter,
+                                    N_pixel=1,
                                     N_angle=parameters["Angle_Reduction"],
-                                    N_angle_start=parameters["Angle_Start_Index"]
+                                    N_angle_start=parameters["Angle_Start_Index"],
                                     )
     
     return photopeak, scatter, object_meta, proj_meta
@@ -108,7 +121,7 @@ def subsample_projections_time(projections: torch.Tensor, t_reduction_factor: fl
 
     # Convert to integer type if not already (Binomial requires integer total_count).
     # This truncates any fractional part. In real data, projection counts are usually integers.
-    counts = projections.to(torch.int64)
+    counts = projections.float()
 
     # Create a Binomial distribution object. total_count is the pixel value, p is the fraction.
     # Note: This is vectorized across the entire tensor.
