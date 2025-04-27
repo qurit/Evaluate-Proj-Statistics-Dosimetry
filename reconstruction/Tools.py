@@ -72,7 +72,6 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
             scatter_projections = get_smoothed_scatter(scatter=scatter_projections, proj_meta=proj_meta, sigma_r=1.0, sigma_z=1.0)
         
         # Apply data reduction: subsample projections number
-        print(proj_meta)
         if "Projections" in params["Data_Reduction"]:
             photopeak_projections, scatter_projections, object_meta, proj_meta = subsample_projections_number(
                 photopeak=photopeak_projections, 
@@ -81,8 +80,6 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
                 proj_meta=proj_meta,
                 parameters=params["Data_Reduction"]["Projections"]
             )
-            
-        print(proj_meta)
                     
         # Build System Matrix
         
