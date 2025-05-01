@@ -116,11 +116,12 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
                 relaxation_sequence = lambda n: 1/(n/50+1))
             
         elif params["Algorithm"] == "KEM":
+            kem_params = params["KEM_Parameters"]
             kem_transform = KEMTransform(
                 support_objects=[att_map],
-                support_kernels_params=[[0.005]],
-                distance_kernel_params=[0.4],
-                top_N=40,
+                support_kernels_params=kem_params["support_kernels_params"],
+                distance_kernel_params=kem_params["distance_kernel_params"],
+                top_N=kem_params["top_N"],
                 kernel_on_gpu=True
             )
             system_matrix_kem = KEMSystemMatrix(system_matrix, kem_transform)
