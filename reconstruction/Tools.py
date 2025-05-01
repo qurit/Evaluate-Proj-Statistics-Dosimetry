@@ -2,7 +2,9 @@ from pytomography.io.SPECT import dicom
 from pytomography.transforms.SPECT import SPECTAttenuationTransform, SPECTPSFTransform
 from pytomography.priors import RelativeDifferencePrior
 from pytomography.priors import TopNAnatomyNeighbourWeight
-from pytomography.algorithms import OSEM, BSREM
+from pytomography.algorithms import OSEM, BSREM, KEM
+from pytomography.transforms.shared import KEMTransform
+from pytomography.projectors.shared import KEMSystemMatrix
 from pytomography.projectors.SPECT import SPECTSystemMatrix
 from pytomography.likelihoods import PoissonLogLikelihood
 import pydicom
@@ -112,6 +114,18 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
                 likelihood,
                 prior = prior_rdpap,
                 relaxation_sequence = lambda n: 1/(n/50+1))
+            
+        elif params["Algorithm"] == "KEM":
+            kem_transform = KEMTransform(
+                support_objects=[att_map],
+                support_kernels_params=[[0.005]],
+                distance_kernel_params=[0.4],
+                top_N=40,
+                kernel_on_gpu=True
+            )
+            system_matrix_kem = KEMSystemMatrix(system_matrix, kem_transform)
+            likelihood_kem = PoissonLogLikelihood(system_matrix_kem, projections=photopeak_projections, additive_term=scatter_projections)
+            reconstruction_algorithm = KEM(likelihood_kem)
         
         else:
             raise NotImplementedError(f"{params['Algorithm']} is not supported")
