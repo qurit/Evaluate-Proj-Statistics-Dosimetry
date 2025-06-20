@@ -2,6 +2,7 @@ import os
 import pydicom
 import pandas
 from datetime import datetime, time
+import shutil
 import re
 
 def create_dicom_inventory(input_path: str) -> pandas.DataFrame:
@@ -280,6 +281,113 @@ def add_cycle_column(df: pandas.DataFrame) -> pandas.DataFrame:
     df = df.drop(columns=['Study Date Parsed', 'Study Date Only']).reset_index(drop=True)
     return df
 
+def remove_duplicate_records(df: pandas.DataFrame) -> pandas.DataFrame:
+    """
+    Remove duplicate rows based on the following columns:
+      - "Patient Name"
+      - "Series description"
+      - "Modality"
+      - "Study Date"
+      - "Acquisition Date"
+      - "Acquisition Time"
+
+    Keeps the first occurrence of each unique combination and drops subsequent duplicates.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The input DataFrame containing imaging study records.
+
+    Returns
+    -------
+    pd.DataFrame
+        A new DataFrame with duplicates removed and index reset.
+    """
+    subset_cols = [
+        "Patient Name",
+        "Series description",
+        "Modality",
+        "Study Date",
+        "Acquisition Date",
+        "Acquisition Time",
+    ]
+    deduped = df.drop_duplicates(subset=subset_cols, keep='first').reset_index(drop=True)
+    return deduped
+
+def filters_inventory(inventory: pandas.DataFrame, cycle: int, output_path: str) -> None:
+    """
+    Filters the inventory DataFrame by cycle and modality rules, then organizes and copies
+    DICOM (.dcm) files into structured folders under the specified output path.
+
+    Parameters
+    ----------
+    inventory : pd.DataFrame
+        DataFrame with columns:
+        "Patient Name", "Series description", "Modality", "Study Date",
+        "Acquisition Date", "Acquisition Time", "Path", "Cycle".
+    cycle : int
+        The cycle number (1 to 6) to filter on.
+    output_path : str
+        Base directory under which per-study folders will be created.
+    """
+    # 1. Filter by cycle
+    df = inventory[inventory["Cycle"] == cycle].copy()
+
+    # 2. Drop unwanted modalities
+    df = df[~df["Modality"].isin(["NM-QSPECT", "DOC"])]
+
+    # 3. Drop RTSTRUCT rows except reviewed structures
+    df = df[~((df["Modality"] == "RTSTRUCT") &
+              (df["Series description"] != "Organs - Dosimetry Structures Reviewed"))]
+
+    # 4. Drop CT rows without 'B30' in Series description
+    df = df[~((df["Modality"] == "CT") &
+              (~df["Series description"].str.contains("B30", na=False)))]
+
+    # 5. Loop through patients and acquisition dates
+    for patient in df["Patient Name"].unique():
+        print("Processing: ", patient)
+        df_patient = df[df["Patient Name"] == patient]
+
+        # Skip patients without RTSTRUCT data
+        if "RTSTRUCT" not in df_patient["Modality"].values:
+            print(f"    No REVIEWED segmentation data found for {patient}")
+            continue
+
+        # Determine TP1 and TP2 based on sorted unique acquisition dates        
+        unique_dates = sorted(df_patient["Study Date"].unique())
+        tp_map = {date: f"TP{i+1}" for i, date in enumerate(unique_dates)}
+
+        for acq_date, tp_label in tp_map.items():
+            df_tp = df_patient[df_patient["Study Date"] == acq_date]
+            
+            for _, row in df_tp.iterrows():
+                modality = row["Modality"]
+                # Determine Bed_ID
+                if modality == "NM-Projections":
+                    bed_id = row["Series description"][-5:].strip()
+                else:
+                    bed_id = "NA"
+
+                # Construct folder name
+                folder_name = f"{patient}-{cycle}-{tp_label}-{modality}-{bed_id}"
+                dest_dir = os.path.join(output_path, patient, folder_name)
+                os.makedirs(dest_dir, exist_ok=True)
+
+                # Copy only .dcm files from the directory in Path
+                file_path = row["Path"]
+                dir_path = os.path.dirname(file_path)
+
+                if os.path.isdir(dir_path):
+                    for fname in os.listdir(dir_path):
+                        if fname.lower().endswith(".dcm"):
+                            src_file = os.path.join(dir_path, fname)
+                            shutil.copy2(src_file, dest_dir)
+                else:
+                    print(f"    Warning: Directory '{dir_path}' does not exist, skipping.")
+
+                print("   ", folder_name)
+
 def qa_inventory(df: pandas.DataFrame) -> None:
     """
     Performs quality assurance on the DataFrame by checking the consistency 
@@ -318,11 +426,12 @@ def qa_inventory(df: pandas.DataFrame) -> None:
         
         # Search for all cycle references in the description.
         matches = pattern.findall(description)
-        
+                
         # For each found cycle reference, assert that it matches the Cycle value.
         for match in matches:
             ref_cycle = int(match)
             if ref_cycle <= 6 and ref_cycle != cycle_value:
+                # TODO: Should update cycle identifier if inconsistency found.
                 print(
                     f"Mismatch on row {idx}: found cycle reference '{ref_cycle}' "
                     f"in description but Cycle column is '{cycle_value}'. "
