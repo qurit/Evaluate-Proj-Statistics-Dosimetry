@@ -69,7 +69,7 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
         )
         
         if params["Data_Reduction"]["Smooth_Scatter"]:
-            scatter_projections = get_smoothed_scatter(scatter=scatter_projections, proj_meta=proj_meta, sigma_r=1.0, sigma_z=1.0)
+            scatter_projections = get_smoothed_scatter(scatter=scatter_projections, proj_meta=proj_meta, sigma_r=0.5/2.355, sigma_z=0.5/2.355)
         
         # Apply data reduction: subsample projections number
         if "Projections" in params["Data_Reduction"]:
