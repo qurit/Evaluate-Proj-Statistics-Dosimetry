@@ -1,13 +1,10 @@
 from pytheranostics.dosimetry.OrganSDosimetry import OrganSDosimetry
 from pytheranostics.dosimetry.VoxelSDosimetry import VoxelSDosimetry
-from pytheranostics.ImagingTools.Tools import load_and_resample_RT_to_target, load_and_register_RT_to_target
+from pytheranostics.ImagingTools.Tools import load_and_resample_RT_to_target
 from pytheranostics.ImagingDS.LongStudy import create_logitudinal_from_dicom
-import matplotlib.pyplot as plt
 from pathlib import Path
-from pytheranostics.dosimetry.olinda import load_phantom_mass
 import pandas
-from typing import Dict, Any
-from copy import deepcopy
+from typing import Dict, Any, List
 
 import pandas
 
@@ -88,6 +85,40 @@ def read_recon_params_from_name(recon_file_name: str) -> Dict[str, Any]:
         "n_iters": int(params[1]),
         "n_subsets": int(params[2])
            }
+ 
+def reformat_dataframe(df: pandas.DataFrame, patient_id: str, algo_params: Dict[str, Any]) -> pandas.DataFrame:
+    """Transforms a DataFrame indexed by region into a tidy format with columns for:
+        - Region
+        - Patient ID
+        - Algorithm parameters 
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        _description_
+    patient_id : str
+        _description_
+    algo_params : Dict[str, Any]
+        _description_
+
+    Returns
+    -------
+    pandas.DataFrame
+        The reformated dataframe
+    """
+    df_tidy = df.reset_index().rename(columns={"index": "Region"})
+    df_tidy["PatientID"] = patient_id
+    
+    new_cols = ["PatientID", "Algorithm", "n_iters", "n_subsets", "Time_Factor", "Projection_Factor", "Smooth_Scatter"]
+    for parameter in new_cols:
+        if parameter != "PatientID":
+            df_tidy[parameter] = algo_params[parameter]
+
+    # Reorder:
+    cols = df_tidy.columns.to_list()
+    new_cols_order = new_cols + [col for col in cols if col not in new_cols]
+    
+    return df_tidy[new_cols_order]
+
     
 def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str], 
                                        rtstr_paths: Dict[int, str], 
@@ -153,7 +184,7 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
 
 
     # Initialize results DataFrame
-    results = pandas.DataFrame()
+    results: List[pandas.DataFrame] = []
     
     # Create Longitudinal CT Study
     ct_paths_list = [path for _, path in ct_paths.items()]
@@ -165,6 +196,10 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
     for recon_name, spect_paths in recons_paths.items():
         
         recon_parameters = read_recon_params_from_name(recon_file_name=recon_name)
+        
+        # Define output path to store results
+        output_dir_recon = Path(output_dir) / f"{recon_name}"
+        output_dir_recon.mkdir(parents=True, exist_ok=True)
         
         print("Recon Parameters:")
         print(recon_parameters)
@@ -190,7 +225,7 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
         time_id = 0
         
         for ct_img_dir, rt_struct_dir in zip(ct_paths_list, rtstr_paths_list):
-
+            
             # Get RT_Struct path to file (should be single file inside this folder)
             rt_struct_tmp = list(Path(rt_struct_dir).glob("*.dcm"))
             assert len(rt_struct_tmp) == 1
@@ -203,9 +238,13 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
             longCT.add_masks_to_time_point(time_id=time_id, masks=ct_masks, mask_mapping=ct_mask_mapping)
             longSPECT.add_masks_to_time_point(time_id=time_id, masks=nm_masks, mask_mapping=spect_mask_mapping)
             
-            # QA: Save CT, SPECT and Masks for visualization
-            # TODO:
-            
+            # QA: Masks for visualization
+            longSPECT.save_masks_to_nii_at(time_id=time_id, out_path=output_dir_recon, 
+                                            regions=["Liver", "Kidney_Left", "Kidney_Right",
+                                                    "ParotidGland_Left", "ParotidGland_Right", 
+                                                    "SubmandibularGland_Left", "SubmandibularGland_Right",
+                                                    "Spleen",
+                                                    "Skeleton"])
             
             time_id += 1 
         
@@ -213,7 +252,7 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
         # QA: ensure mandatory info is present in dosimetry config:
         #     PatientID, Cycle, Output Dir, Injection Dates and Time...
         
-        dosimetry_config.config["DatabaseDir"] = output_dir
+        dosimetry_config.config["DatabaseDir"] = str(output_dir_recon)
         
         if dosimetry_config.config["InjectedActivity"] is None:
             dosimetry_config.config["InjectedActivity"] = longSPECT.meta[0]["Injected_Activity_MBq"]
@@ -258,7 +297,10 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
         dose_calculator.compute_tia()
             
         # Aggregate Results
+        tmp_results = reformat_dataframe(df=dose_calculator.results.copy(), 
+                                         patient_id=dosimetry_config.config["PatientID"],
+                                         algo_params=recon_parameters)
+        results.append(tmp_results)
         
-        
-    return results
+    return pandas.concat(results, ignore_index=True)
 
