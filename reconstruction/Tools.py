@@ -1,15 +1,17 @@
 from pytomography.io.SPECT import dicom
 from pytomography.transforms.SPECT import SPECTAttenuationTransform, SPECTPSFTransform
-from pytomography.priors import RelativeDifferencePrior
-from pytomography.priors import TopNAnatomyNeighbourWeight
-from pytomography.algorithms import OSEM, BSREM
-from pytomography.projectors.SPECT import SPECTSystemMatrix
-from pytomography.likelihoods import PoissonLogLikelihood
+from pytomography.priors import RelativeDifferencePrior, TopNAnatomyNeighbourWeight
+from pytomography.algorithms import OSEM, BSREM, KEM
+from pytomography.transforms.shared import KEMTransform
+from pytomography.projectors.shared import KEMSystemMatrix
+from pytomography.projectors.SPECT import SPECTSystemMatrix, MonteCarloHybridSPECTSystemMatrix
+from pytomography.likelihoods import PoissonLogLikelihood, MonteCarloHybridSPECTPoissonLogLikelihood
 import pydicom
 import torch
 from typing import List, Dict
 from reconstruction.Subsample import subsample_projections_number, subsample_projections_time
 from pytomography.utils.scatter import get_smoothed_scatter
+from pytomography.utils import simind_mc
 
 def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], params: Dict, output_path: str) -> None:
     """Reconstruct multi-bed SPECT projection data utilizing reconstruction parameters defined by the 
@@ -22,11 +24,41 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
     ct_data_dcm : List[str]
         List of paths to CT .dcm files, one for each slice. List[str]
     params : Dict
-        Dictionary containing reconstruction parameters: Algorithm, Algorithm_HyperParameters, Projections_Fraction, Time_Proj_Fraction
+        Dictionary containing reconstruction parameters:
+        
+        - Data_Reduction: 
+            - Projections:
+                - Projections_Fraction: List[int]
+                    - 1 (total projections), 2 (half), 3 (third), ....
+                - Projection_Start_Index: List[int]
+                    - 0 (for all proj_frac), 1 (for proj_frac > 1), 2 (for proj_frac > 2), ....
+            - Time_Proj_Fraction: List[float]
+                - 1 (total time per projection), 0.75 (three fourth), 0.5 (half), 0.25 (quater), ....
+            - Smooth_Scatter
+        - SPECT info:
+            - Collimator: [str]
+            - Model: [str]
+            - Photopeak_Energy: [int]
+        - Algorithm: List[str]
+                - "OSEM", "MC_OSEM", "KEM", "BSREM"
+                - algorithm specific additional parameters:
+                    - for KEM
+                        - support_kernels_params: [float]
+                        - distance_kernel_params: [float]
+                        - top_N: [int]
+                    - for MC
+                        - n_events (no. of simulated photons per projection) [int]
+                        - n_parallel (no. of parallel CPUs): [int]
+                        - crystal_thickness [cm]: [float]
+                        - cover_thickness[cm]: [float]
+                        - backscatter_thickness[cm]: [float]
+        - Algorithm_HyperParameters: List[int]
+                - no. of iterations
+                - no. of subsets with adjusted_subsets = int(n_subs/proj)
+                        - same no. of proj in each subset, therefore less subsets for less proj
     output_path : Path
         Path where reconstructed SPECT image will be stored.
     """
-    
     # Define Photopeak, Lower and Upper energy window indices.
     index_photopeak = 0
     index_lower = 1
@@ -51,6 +83,15 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
         photopeak_projections = bed_pos_proj[index_photopeak]
         upper_projections = bed_pos_proj[index_upper]
         lower_projections = bed_pos_proj[index_lower]
+
+        # decimal points for energy window values (needed for simind)
+        energy_window_params = simind_mc.get_energy_window_params_dicom(bed_pos_dcm)
+        modified_params = []
+        for param in energy_window_params:
+            parts = param.split(',')
+            parts[0] = str(float(parts[0]))  #1st value to float
+            parts[1] = str(float(parts[1]))  #2nd value to float
+            modified_params.append(','.join(parts))
         
         # Apply Projection Time Reduction (Poisson thinning):
         if "Time" in params["Data_Reduction"]:
@@ -112,15 +153,68 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
                 likelihood,
                 prior = prior_rdpap,
                 relaxation_sequence = lambda n: 1/(n/50+1))
+            
+        elif params["Algorithm"] == "KEM":
+            kem_params = params["KEM_Parameters"]
+            kem_transform = KEMTransform(
+                support_objects=[att_map],
+                support_kernels_params=kem_params["support_kernels_params"],
+                distance_kernel_params=kem_params["distance_kernel_params"],
+                top_N=kem_params["top_N"],
+                kernel_on_gpu=True
+            )
+            system_matrix_kem = KEMSystemMatrix(system_matrix, kem_transform)
+            likelihood_kem = PoissonLogLikelihood(system_matrix_kem, projections=photopeak_projections, additive_term=scatter_projections)
+            reconstruction_algorithm = KEM(likelihood_kem)
         
+        elif params["Algorithm"] == "MC_OSEM":
+            amap140 = dicom.get_attenuation_map_from_CT_slices(ct_data_dcm, bed_pos_dcm, E_SPECT=140.5) #needed for MC forward proj
+            amap208 = dicom.get_attenuation_map_from_CT_slices(ct_data_dcm, bed_pos_dcm, E_SPECT=208) #photopeak
+            
+            # Transforms
+            att_transform = SPECTAttenuationTransform(amap208)
+            psf_meta = dicom.get_psfmeta_from_scanner_params(
+                collimator_name=params["Collimator"],
+                energy_keV=params["Photopeak_Energy"]
+            )
+            psf_transform = SPECTPSFTransform(psf_meta)
+            mc_params = params["MC_Parameters"]
+
+            # Get and convert energy window parameters
+            energy_window_params = modified_params
+            # MC forward projection and analytical back projection
+            system_matrix = MonteCarloHybridSPECTSystemMatrix(
+                object_meta,
+                proj_meta,
+                obj2obj_transforms=[att_transform, psf_transform],
+                proj2proj_transforms=[],
+                attenuation_map_140keV=amap140,
+                energy_window_params=energy_window_params,
+                primary_window_idx=index_photopeak, 
+                isotope_names=['lu177'], #simulate isotope
+                isotope_ratios=[1], #ratio of isotopes
+                collimator_type=params["Collimator"],
+                crystal_thickness=mc_params["crystal_thickness"], # cm
+                cover_thickness=mc_params["cover_thickness"], # cm
+                backscatter_thickness=mc_params["backscatter_thickness"], # cm
+                advanced_energy_resolution_model=params["Model"],
+                advanced_collimator_modeling=True,
+                energy_resolution_140keV=10, # if not using model
+                n_events=mc_params["n_events"],
+                n_parallel=mc_params["n_parallel"]
+            )
+
+            likelihood = MonteCarloHybridSPECTPoissonLogLikelihood(system_matrix, photopeak_projections)
+            reconstruction_algorithm = OSEM(likelihood)
+
         else:
             raise NotImplementedError(f"{params['Algorithm']} is not supported")
         
         reconstructed_beds.append(reconstruction_algorithm(**params["Algorithm_HyperParameters"]))
-        
+
     # Stitch Reconstructions
     wb_recon = dicom.stitch_multibed(recons=torch.stack(reconstructed_beds), files_NM=projection_data_dcm)
-    
+
     # Save DICOM
     print(f"Saving: {params['Recon_Name']} ... ")
     
@@ -130,5 +224,3 @@ def reconstruct_study(projection_data_dcm: List[str], ct_data_dcm: List[str], pa
         file_NM = projection_data_dcm[0],
         recon_name=params["Recon_Name"],
         single_dicom_file=True)
-        
-    
