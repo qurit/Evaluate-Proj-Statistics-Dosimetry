@@ -3,10 +3,8 @@ from pytheranostics.dosimetry.VoxelSDosimetry import VoxelSDosimetry
 from pytheranostics.ImagingTools.Tools import load_and_resample_RT_to_target
 from pytheranostics.ImagingDS.LongStudy import create_logitudinal_from_dicom
 from pathlib import Path
-import pandas
+import pandas as pd
 from typing import Dict, Any, List
-
-import pandas
 
 class DefaultR21Config:
     def __init__(self, mode: str = "Organ-Olinda") -> None:
@@ -63,7 +61,7 @@ class DefaultR21Config:
 
 def read_recon_params_from_name(recon_file_name: str) -> Dict[str, Any]:
     """Reads the parameters associated with a reconstruction file with the filename format:
-       `OSEM_24_8_Time_1.0_Proj_1_SctSmooth_True`
+       OSEM_i_20_s_4_Time_1_Proj_3_Start_0_SctSmooth_True_TP1
 
     Parameters
     ----------
@@ -76,17 +74,73 @@ def read_recon_params_from_name(recon_file_name: str) -> Dict[str, Any]:
         A dictionary with the reconstruction parameters.
     """
     params = recon_file_name.split("_")
+    """['OSEM', 'i', '20', 's', '4', 'Time', '1', 'Proj', '3', 'Start', '0', 'SctSmooth', 'True', 'TP1']"""
 
     return {
-        "Time_Factor": float(params[4]), 
-        "Projection_Factor": int(params[3]),
-        "Smooth_Scatter": True if params[5] == "True" else False,
         "Algorithm": params[0],
-        "n_iters": int(params[1]),
-        "n_subsets": int(params[2])
+        "n_iters": int(params[2]),
+        "n_subsets": int(params[4]),
+        "Time_Reduction_Factor": float(params[6]), 
+        "Projection_Reduction_Factor": int(params[8]),
+        "Smooth_Scatter": True if params[12] == "True" else False,
+        "TP": params[13]
            }
+
+def get_injection_info_from_excel(excel_path: str, patient_id: str) -> dict[str, Any]:
+    """Reads injected activity, injection date, and time from an Excel file
+    
+    Parameters
+    ----------
+    excel_path : str
+        Path to the excel file
+    patient_id : str
+        Patient ID to get matching information
+    
+    Returns
+    -------
+    dict[str,Any]
+        a dictionary with 'InjectedActivity', 'InjectionDate', 'InjectionTime'
+    """
+    df = pd.read_excel(excel_path)
+
+    row = df[df["PatientID"] == patient_id]
+
+    if row.empty:
+        raise ValueError(f"PatientID '{patient_id}' missing.")
+
+    # Parse Injection Date
+    injection_date_raw = row["Injection Date"].values[0]
+    injection_date = pd.to_datetime(injection_date_raw).date()
+
+    # Parse Injection Time with AM/PM handling
+    injection_time_raw = row["Injection Time"].values[0]
+    # If it's already datetime.time, just use it
+    if isinstance(injection_time_raw, pd.Timestamp):
+        injection_time = injection_time_raw.time()
+    elif isinstance(injection_time_raw, str):
+        injection_time = pd.to_datetime(injection_time_raw).time()
+    else:
+        # Otherwise, try to convert with pd.to_datetime and then get time
+        injection_time = pd.to_datetime(str(injection_time_raw)).time()
+
+    return {
+        "InjectedActivity": float(row["Injected Activity [MBq]"].values[0]),
+        "InjectionDate": injection_date.strftime("%Y%m%d"),
+        "InjectionTime": injection_time.strftime("%H%M%S"), 
+    }
+
+def build_dosimetry_config_from_excel(excel_path, patient_id):
+    config = DefaultR21Config()
+    info = get_injection_info_from_excel(excel_path, patient_id)
+    config.config["InjectedActivity"] = info["InjectedActivity"]
+    config.config["InjectionDate"] = info["InjectionDate"]
+    config.config["InjectionTime"] = info["InjectionTime"]
+    config.config["PatientID"] = patient_id
+    config.config["Cycle"] = 1
+    return config
+
  
-def reformat_dataframe(df: pandas.DataFrame, patient_id: str, algo_params: Dict[str, Any]) -> pandas.DataFrame:
+def reformat_dataframe(df: pd.DataFrame, patient_id: str, algo_params: Dict[str, Any]) -> pd.DataFrame:
     """Transforms a DataFrame indexed by region into a tidy format with columns for:
         - Region
         - Patient ID
@@ -108,7 +162,7 @@ def reformat_dataframe(df: pandas.DataFrame, patient_id: str, algo_params: Dict[
     df_tidy = df.reset_index().rename(columns={"index": "Region"})
     df_tidy["PatientID"] = patient_id
     
-    new_cols = ["PatientID", "Algorithm", "n_iters", "n_subsets", "Time_Factor", "Projection_Factor", "Smooth_Scatter"]
+    new_cols = ["PatientID", "Algorithm", "n_iters", "n_subsets", "Time_Reduction_Factor", "Projection_Reduction_Factor", "Smooth_Scatter"]
     for parameter in new_cols:
         if parameter != "PatientID":
             df_tidy[parameter] = algo_params[parameter]
@@ -124,7 +178,7 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
                                        rtstr_paths: Dict[int, str], 
                                        recons_paths: Dict[str, Dict[int, str]],
                                        output_dir: str,
-                                       dosimetry_config: DefaultR21Config) -> pandas.DataFrame:
+                                       dosimetry_config: DefaultR21Config) -> pd.DataFrame:
     """Run patient Dosimetry over a cycle of a patient and a batch of SPECT reconstructions
 
     Parameters
@@ -184,7 +238,7 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
 
 
     # Initialize results DataFrame
-    results: List[pandas.DataFrame] = []
+    results: List[pd.DataFrame] = []
     
     # Create Longitudinal CT Study
     ct_paths_list = [path for _, path in ct_paths.items()]
@@ -195,7 +249,11 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
     # Loop through available SPECT Reconstruction methods
     for recon_name, spect_paths in recons_paths.items():
         
-        recon_parameters = read_recon_params_from_name(recon_file_name=recon_name)
+            # Get any time point folder name with _TPx suffix
+        first_tp_path = next(iter(spect_paths.values()))
+        folder_name = Path(first_tp_path).name  # get folder basename with _TPx suffix
+    
+        recon_parameters = read_recon_params_from_name(recon_file_name=folder_name)
         
         # Define output path to store results
         output_dir_recon = Path(output_dir) / f"{recon_name}"
@@ -205,8 +263,8 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
         print(recon_parameters)
         
         # We need to feed the calibration factor so that the reconstructed image, which is in units of Counts * Num_Projections is converted to units of activity.
-        num_proj_recon = 1 / recon_parameters["Projection_Factor"] * num_projections
-        proj_time = recon_parameters["Time_Factor"] * frame_duration
+        num_proj_recon = 1 / recon_parameters["Projection_Reduction_Factor"] * num_projections
+        proj_time = recon_parameters["Time_Reduction_Factor"] * frame_duration
         
         raw_counts_to_bq_per_ml = 1 / (proj_time * num_proj_recon) * lu177_cf * 1e6 * 1 / vox_vol_ml
 
@@ -215,7 +273,8 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
         
         longSPECT = create_logitudinal_from_dicom(dicom_dirs=spect_paths_list,
                                                   modality="Lu177_SPECT", 
-                                                  calibration_factor=raw_counts_to_bq_per_ml)
+                                                  calibration_factor=raw_counts_to_bq_per_ml,
+                                                  dosimetry_config=dosimetry_config)
         
         # QA: Ensure we have as many time-points in SPECT as in CT
         if len(longSPECT.images) != len(longCT.images):
@@ -254,16 +313,13 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
         
         dosimetry_config.config["DatabaseDir"] = str(output_dir_recon)
         
-        if dosimetry_config.config["InjectedActivity"] is None:
-            dosimetry_config.config["InjectedActivity"] = longSPECT.meta[0]["Injected_Activity_MBq"]
-        
         # If no information about administered activity time, assume equal to imaging time.
         
         if dosimetry_config.config["InjectionDate"] is None:
             
             print("Missing Information about administered Activity. Assuming 7400 MBq administered at imaging time.")
             
-            dosimetry_config.config["InjectionDate"] = longSPECT.meta[0]["AcquisitionDate"]
+            dosimetry_config.config["InjectionDate"] = longSPECT.meta[0]["AcquisitionDate"] 
             dosimetry_config.config["InjectionTime"] = longSPECT.meta[0]["AcquisitionTime"]
         
         
@@ -302,5 +358,5 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
                                          algo_params=recon_parameters)
         results.append(tmp_results)
         
-    return pandas.concat(results, ignore_index=True)
+    return pd.concat(results, ignore_index=True)
 
