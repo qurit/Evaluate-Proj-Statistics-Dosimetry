@@ -178,7 +178,8 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
                                        rtstr_paths: Dict[int, str], 
                                        recons_paths: Dict[str, Dict[int, str]],
                                        output_dir: str,
-                                       dosimetry_config: DefaultR21Config) -> pd.DataFrame:
+                                       dosimetry_config: DefaultR21Config,
+                                       scal_numb_proj: bool) -> pd.DataFrame:
     """Run patient Dosimetry over a cycle of a patient and a batch of SPECT reconstructions
 
     Parameters
@@ -220,7 +221,7 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
         "Submandibular_R_m": "SubmandibularGland_Right",
         "Skeleton": "Skeleton",                           
         "WBCT": "WholeBody"
-                        }
+                        } 
     
     spect_mask_mapping = {
         "Liver": "Liver",
@@ -263,10 +264,11 @@ def run_patient_dosimetry_recons_batch(ct_paths: Dict[int, str],
         print(recon_parameters)
         
         # We need to feed the calibration factor so that the reconstructed image, which is in units of Counts * Num_Projections is converted to units of activity.
-        num_proj_recon = 1 / recon_parameters["Projection_Reduction_Factor"] * num_projections
+        num_proj_recon = 1
         proj_time = recon_parameters["Time_Reduction_Factor"] * frame_duration
-        
-        raw_counts_to_bq_per_ml = 1 / (proj_time * num_proj_recon) * lu177_cf * 1e6 * 1 / vox_vol_ml
+        if scal_numb_proj:
+            num_proj_recon = 1 / recon_parameters["Projection_Reduction_Factor"] * num_projections
+        raw_counts_to_bq_per_ml = 1 / (proj_time * num_proj_recon) / lu177_cf * 1e6 * 1 / vox_vol_ml
 
         # Create Longitudinal SPECT Study
         spect_paths_list = [spect_path for _, spect_path in spect_paths.items()]
