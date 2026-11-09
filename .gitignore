@@ -5,5 +5,8 @@ Notebooks/
 # Images
 PR21*
 
+# Local acquisition data
+/data-ac225/
+
 # Cache
 __pycache__

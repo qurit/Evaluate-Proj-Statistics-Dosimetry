@@ -4,41 +4,21 @@ from pytomography.metadata.SPECT import SPECTObjectMeta, SPECTProjMeta
 from typing import Tuple, Dict, Any
 
 import torch
-from torch.distributions import Binomial
 
-def binomial_thinning(projections: torch.Tensor, t_reduction_factor: float) -> torch.Tensor:
-    """
-    Apply binomial thinning to a batch of 2D projection images.
-    
-    For each pixel (count = x), we draw y ~ Binomial(x, p = t_reduction_factor).
-    This simulates 'thinning' the counts to match a shorter acquisition time.
-    
-    Args:
-        projections (torch.Tensor): A 3D tensor of shape (N_proj, N_x, N_y) containing
-                                    integer-valued pixel counts for each projection.
-        t_reduction_factor (float): Fraction by which counts are thinned. 
-                                    E.g., 0.666... to reduce from 15s to 10s.
-                                    Must be between 0.0 and 1.0 inclusive.
-    
-    Returns:
-        torch.Tensor: A 3D tensor of the same shape, with each pixel count
-                      replaced by a binomially thinned value.
-    """
-    if not (0.0 < t_reduction_factor <= 1.0):
-        raise ValueError("t_reduction_factor must be in (0, 1].")
-
-    # Convert to integer type if not already (Binomial requires integer total_count).
-    # This truncates any fractional part. In real data, projection counts are usually integers.
-    counts = projections.to(torch.int64)
-
-    # Create a Binomial distribution object. total_count is the pixel value, p is the fraction.
-    # Note: This is vectorized across the entire tensor.
-    dist = Binomial(total_count=counts, probs=t_reduction_factor)
-
-    # Sample from the distribution to get the thinned counts.
-    thinned_counts = dist.sample()
-
-    return thinned_counts
+def binomial_thinning(projections: torch.Tensor, t_reduction_factor: float,
+                     generator: torch.Generator | None = None) -> torch.Tensor:
+    """Thin nonnegative integer counts; preserve full-count data without sampling."""
+    if not 0 <= t_reduction_factor <= 1:
+        raise ValueError("t_reduction_factor must be in [0, 1].")
+    if not torch.isfinite(projections).all() or (projections < 0).any():
+        raise ValueError("Projection counts must be finite and nonnegative.")
+    counts = projections.float()
+    if not torch.equal(counts, counts.round()):
+        raise ValueError("Binomial thinning requires integer projection counts.")
+    if t_reduction_factor == 1:
+        return projections.clone()
+    return torch.binomial(counts, torch.full_like(counts, t_reduction_factor),
+                          generator=generator)
 
 
 def subsample_projections_number(
@@ -98,36 +78,7 @@ def subsample_projections_number(
     return photopeak, scatter, object_meta, proj_meta
 
 
-def subsample_projections_time(projections: torch.Tensor, t_reduction_factor: float) -> torch.Tensor:
-    """
-    Apply binomial thinning to a batch of 2D projection images.
-    
-    For each pixel (count = x), we draw y ~ Binomial(x, p = t_reduction_factor).
-    This simulates 'thinning' the counts to match a shorter acquisition time.
-    
-    Args:
-        projections (torch.Tensor): A 3D tensor of shape (N_proj, N_x, N_y) containing
-                                    integer-valued pixel counts for each projection.
-        t_reduction_factor (float): Fraction by which counts are thinned. 
-                                    E.g., 0.666... to reduce from 15s to 10s.
-                                    Must be between 0.0 and 1.0 inclusive.
-    
-    Returns:
-        torch.Tensor: A 3D tensor of the same shape, with each pixel count
-                      replaced by a binomially thinned value.
-    """
-    if not (0.0 <= t_reduction_factor <= 1.0):
-        raise ValueError("t_reduction_factor must be in [0, 1].")
-
-    # Convert to integer type if not already (Binomial requires integer total_count).
-    # This truncates any fractional part. In real data, projection counts are usually integers.
-    counts = projections.float()
-
-    # Create a Binomial distribution object. total_count is the pixel value, p is the fraction.
-    # Note: This is vectorized across the entire tensor.
-    dist = Binomial(total_count=counts, probs=t_reduction_factor)
-
-    # Sample from the distribution to get the thinned counts.
-    thinned_counts = dist.sample()
-
-    return thinned_counts
+def subsample_projections_time(projections: torch.Tensor, t_reduction_factor: float,
+                              generator: torch.Generator | None = None) -> torch.Tensor:
+    """Simulate a shorter acquisition using binomial thinning of raw counts."""
+    return binomial_thinning(projections, t_reduction_factor, generator)
